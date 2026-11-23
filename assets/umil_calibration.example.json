@@ -1,0 +1,18 @@
+{
+  "side": "right",
+  "calibration_source": "example",
+  "seed_joints_rad": [-0.65, -1.10, 1.10, -1.15, -0.35, 0.15, 0.10],
+  "ee_from_grasp": [
+    [1, 0, 0, 0],
+    [0, 1, 0, 0],
+    [0, 0, 1, 0],
+    [0, 0, 0, 1]
+  ],
+  "flange_from_grasp": [
+    [1, 0, 0, 0],
+    [0, 1, 0, 0],
+    [0, 0, 1, 0],
+    [0, 0, 0, 1]
+  ],
+  "base_from_recording": null
+}

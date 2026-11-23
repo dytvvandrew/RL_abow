@@ -105,6 +105,32 @@ printf '%s\n' '{"state":{"height_m":0.42,"pitch_rad":0.01}}' \
 2. **按实际硬件重定时。** 对目标位姿求连续逆解，检查关节位置、速度、加速度、腕部耦合和碰撞间隙。录下天机带载反馈、Revo2 张指指令和瓶子实际离手时刻，按实测延迟补偿。用实瓶视频测离手速度、翻转角速度和飞行减速，校准水晃动及落桌接触参数。
 3. **用真机试投学习松手窗口。** 一条 UMI 成功示教可提供挥臂与出手的起点，示教结果单独保存。先用少量已验过的挥臂和松手档位做固定参数基线，再将真机成功与失败统一写入上面的 JSONL。用同一瓶型、水量和落区进行独立试投，比较 IQL 与固定基线。
 
+### UMI-Lite 离线映射
+
+入口支持 UMI-Lite 的 LeRobot v2.1 和 v3.0。v2.1 每集一个 Parquet，v3.0 从合并的 Parquet 按 `episode_index` 取一集。以实查的 `watering_can` 第 0 集为例，它包含 583 帧，播放频率为 30 Hz。
+
+- `observation.right.ee_pose` 和 `observation.left.ee_pose` 是手端位姿，格式为 `[x, y, z, qx, qy, qz, qw]`，位置单位为米，坐标属于当前录制的 OpenXR LOCAL，`+Y` 向上。映射直接使用已经标定的 `ee_pose`。
+- `timestamp` 用于回放时间，`source.<side>.controller.timestamp_ns` 保留原始跟踪时钟，`valid.<side>.controller` 标记跟踪有效。跟踪丢失或时间不连续的区段需要重新选取。
+- `observation.state` 和 `action` 各含 12 个双手手指关节值。机械臂依据末端位姿做逆解。
+
+```bash
+python -m pip install -r requirements-umil.txt
+
+python -m bottle_flip.umil inspect --dataset "/path/to/watering_can" \
+  --episode 0 --side right
+
+python -m bottle_flip.umil retarget --dataset "/path/to/watering_can" \
+  --episode 0 --side right --start-frame 0 --stop-frame 40 \
+  --arm-assets "/path/to/Stand-m6" --calibration assets/umil_calibration.example.json \
+  --output runs/umil_tianji_plan.json
+```
+
+`--dataset` 指向包含 `meta/` 和 `data/` 的任务目录。`--stop-frame` 为不包含在内的终点，省略时读到集末。`--time-scale` 可拉伸回放时间，默认保留示教节奏。
+
+[标定模板](assets/umil_calibration.example.json) 的示例矩阵供离线联调用。采到扔瓶数据后，填入相应侧的天机初始关节角（弧度）、`ee_from_grasp` 和 `flange_from_grasp`。以瓶盖中心和夹持轴定义同一个抓取坐标系，每个矩阵将该坐标系变换到对应末端。若 `base_from_recording` 为 `null`，选中窗口的首帧与天机初始抓取位姿对齐。已有录制坐标系到天机底座的实测标定时，用它填充 `base_from_recording`，可按绝对位置重定向。
+
+输出 JSON 包含源帧号、播放时间、跟踪时间戳、天机法兰目标、七轴关节角及跟踪误差。逆解检查 URDF 和可用的 M6 SDK 关节位置、速度与 J6/J7 耦合限制，加速度峰值作为诊断记录。不可行时返回首个失败帧和误差，退出码为 2。当前输出供离线运动学检查，碰撞、带载跟踪和 Revo2 松手需要按实机标定。
+
 ## 仿真覆盖范围
 
 当前仿真包含带扰动的挥臂反馈、开手延迟、重力抛物线、随时间变化的瓶体转动惯量和近似着地稳定性。它可以闭环验证数据格式、奖励、两次决策和策略相对于固定参数的表现。

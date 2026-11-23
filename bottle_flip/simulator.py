@@ -43,7 +43,7 @@ def _clearance(height, pitch):
 
 
 def angular_rate(t, initial_rate, inertia_growth):
-    # Water relocation is represented by a time-varying inertia, not a fluid solver.
+    # Effective inertia growth approximates the loss of spin as water redistributes.
     fraction = 1 - math.exp(-(t / 0.25) ** 3)
     return initial_rate / (1 + inertia_growth * fraction)
 

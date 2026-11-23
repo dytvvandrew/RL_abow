@@ -60,12 +60,50 @@ class Joint:
 
 
 class Tianji:
-    def __init__(self, urdf, base):
+    def __init__(self, urdf, base, side="R"):
+        if side not in ("L", "R"):
+            raise ValueError("Stand-m6 arm side must be L or R")
         self.urdf = ET.parse(urdf).getroot()
         self.base = base
-        self.chain = [Joint.parse(element) for element in self.urdf.findall("joint")
-                      if element.attrib["name"].endswith("_R")]
+        self.side = side
+        arm = [element for element in self.urdf.findall("joint")
+               if element.attrib["name"].endswith(f"_{side}")]
+        self.chain = [Joint.parse(element) for element in arm]
         self.lower, self.upper = np.asarray([joint.limits for joint in self.chain[:-1]]).T
+        self.speed_limits = np.asarray([float(element.find("limit").attrib["velocity"])
+                                        for element in arm if element.attrib["type"] == "revolute"])
+
+    @property
+    def forward_axis(self):
+        # The factory Stand frame uses -Y forward and +X left.
+        return -self.base[:3, 1]
+
+    def apply_m6_sdk_limits(self, path):
+        """Intersect URDF limits with the delivered TYPE1017 M6 configuration."""
+        rows = [[float(value) for value in line.split(",") if value.strip()]
+                for line in path.read_text().splitlines() if line.strip()]
+        if len(rows) != 26 or rows[0][0] != 1017 or rows[13][0] != 1017:
+            raise ValueError(f"{path}: expected two TYPE1017 M6 arm blocks")
+        first = 14 if self.side == "R" else 1
+        limits = np.deg2rad(np.asarray([row[4:7] for row in rows[first:first + 7]])).T
+        if limits.shape != (3, 7) or not np.isfinite(limits).all() or np.any(limits[2] <= 0):
+            raise ValueError(f"{path}: invalid arm {self.side} limits")
+        self.lower = np.maximum(self.lower, limits[0])
+        self.upper = np.minimum(self.upper, limits[1])
+        self.speed_limits = np.minimum(self.speed_limits, limits[2])
+        if np.any(self.lower >= self.upper):
+            raise ValueError(f"{path}: SDK and URDF position limits do not overlap")
+
+    def upper_arm_vectors(self, angles):
+        """Return world-space shoulder-to-elbow vectors for joint samples."""
+        shoulder, elevation, elbow = self.chain[:3]
+        upper = elbow.pose[:3, 3]
+        swing = np.stack([rotation(elevation.axis, angle) @ upper
+                          for angle in angles[:, 1]])
+        swing = swing @ elevation.pose[:3, :3].T
+        rotated = np.stack([rotation(shoulder.axis, angle) @ vector
+                            for angle, vector in zip(angles[:, 0], swing)])
+        return rotated @ (self.base @ shoulder.pose)[:3, :3].T
 
     def evaluate(self, angles):
         pose = self.base
@@ -122,23 +160,37 @@ PAD_OFFSETS = np.asarray([
     [-0.0039, 0.0, 0.0016], [-0.0037, 0.0, 0.0017], [-0.0036, 0.0, 0.0004],
 ])
 PAD_RADIUS = 0.009
+CAP_RADIUS = 0.0155
+CAP_CENTER_HEIGHT = 0.096
 GRIP_CENTER = np.array([0.055, 0.027, 0.098])
 OPEN = np.array([0.24, 0.00, 0.00, 0.00, 0.00, 0.00])
 ACTUATED = ("right_thumb_metacarpal_joint", *(f"right_{digit}_proximal_joint" for digit in DIGITS))
 
 
+def _revo2_joints():
+    urdf = ET.parse(ASSET_DIRECTORY / "urdf" / "revo2_right_hand.urdf").getroot()
+    return [Joint.parse(element) for element in urdf.findall("joint")]
+
+
 class Revo2Pads:
     def __init__(self):
-        urdf = ET.parse(ASSET_DIRECTORY / "urdf" / "revo2_right_hand.urdf").getroot()
-        self.joints = [Joint.parse(element) for element in urdf.findall("joint")]
+        self.joints = _revo2_joints()
         self.near = self._fit_aperture(0.0435)
         self.closed = self._fit_aperture(0.0395)
 
-    def evaluate(self, curl):
+    def _commands(self, curl):
         if curl <= 0.85:
-            commands = OPEN + (curl / 0.85) * (self.near - OPEN)
-        else:
-            commands = self.near + ((curl - 0.85) / 0.15) * (self.closed - self.near)
+            return OPEN + (curl / 0.85) * (self.near - OPEN)
+        return self.near + ((curl - 0.85) / 0.15) * (self.closed - self.near)
+
+    def evaluate(self, curl, index_curl=None, thumb_press=0.0):
+        commands = self._commands(curl)
+        if index_curl is not None:
+            commands[2] = self._commands(index_curl)[2]
+        # The metacarpal sweeps the thumb down along the bottle. A small
+        # flexion keeps the pad in contact as the metacarpal rotates.
+        commands[0] += thumb_press
+        commands[1] += 0.12 * thumb_press
         return self._forward(commands)
 
     def _fit_aperture(self, radius):
@@ -166,3 +218,30 @@ class Revo2Pads:
             for digit, offset in zip(DIGITS, PAD_OFFSETS)
         ])
         return angles, pads
+
+
+class Revo2CapPinch(Revo2Pads):
+    """Oppose two pads across the cap and curl the other fingers away from the bottle."""
+
+    def __init__(self):
+        self.joints = _revo2_joints()
+        parked = np.full(3, 1.30)
+        angle = math.radians(35.0)
+        direction = np.array([math.sin(angle), 0.0, -math.cos(angle)])
+        target = 2.0 * (CAP_RADIUS + PAD_RADIUS - 0.0009) * direction
+        actuated_limits = {joint.name: joint.limits for joint in self.joints if joint.name in ACTUATED}
+
+        def error(commands):
+            pads = self._forward(np.r_[commands, parked])[1]
+            return pads[0] - pads[1] - target
+
+        limits = np.asarray([actuated_limits[name] for name in ACTUATED[:3]]).T
+        fit = least_squares(error, [1.25, 0.30, 0.44], bounds=limits, gtol=1e-11)
+        if np.linalg.norm(fit.fun) > 0.0001:
+            raise ValueError("Revo2 thumb and index cannot oppose across the cap")
+        self.closed = np.r_[fit.x, parked]
+        self.open = self.closed - np.array([0.0, 0.16, 0.15, 0.0, 0.0, 0.0])
+        self.center = self._forward(self.closed)[1][:2].mean(axis=0)
+
+    def evaluate(self, curl, index_curl=None, thumb_press=0.0):
+        return self._forward(self.open + curl * (self.closed - self.open))

@@ -5,7 +5,8 @@
 ## 当前进展
 
 - **简化仿真与离线训练**。已跑通逐投 JSONL、两阶段 IQL 和固定参数基线。用 216 条模拟试投生成训练数据，在另组 400 对仿真试投中，IQL 成功 174 次，固定参数成功 110 次。
-- **Isaac Sim 整臂接触演示**。已接入天机右臂和 Revo2。标定轨迹下，瓶子靠指尖接触离桌，脱手后翻转约 366.5°，瓶底落入目标区并站稳 3.23 秒。
+- **Isaac Sim 整臂接触演示**。天机右臂的大臂从竖直向前抬约 35°，前臂和 Revo2 向上抖腕。低重心瓶子脱手后翻转约 341.9°，瓶底触桌并站稳 2.45 秒。
+- **Isaac Sim 双指夹盖演示**。瓶身、瓶肩、瓶颈和瓶盖分别参与碰撞。拇指与食指夹盖，另三指收向掌心。标定轨迹测得张指到离手约 20.8 ms，瓶身翻转约 358.0°并站稳 2.87 秒。
 - **待验证**。整臂演示目前使用标定轨迹，已训练的 IQL 对应简化仿真。人类示教采集、真机数据训练和实机成功率验证仍待进行。
 
 ## 快速运行
@@ -98,11 +99,21 @@ printf '%s\n' '{"state":{"height_m":0.42,"pitch_rad":0.01}}' \
 
 接入控制进程时，用 `bottle_flip.policy.load_policies(path)["iql"]` 加载一次模型，然后在两个决策点分别调用 `choose_swing(swing_state, available=allowed_swings)` 和 `choose_release(release_state, swing_id, available=allowed_releases)`。观测对象由 `bottle_flip.data` 中的 `SwingState` 和 `ReleaseState` 构造。无可用动作时会抛出 `UnsupportedStateError`。
 
+## UMI 到天机与 Revo2 的迁移方案
+
+1. **统一抓取坐标。** 把 UMI 位姿、外部相机和天机底座对齐到同一个桌面坐标系。以瓶盖中心和双指对捏轴定义抓取坐标系，分别标定 UMI 夹爪与实际 Revo2 转接板到该坐标系的变换。用抓稳时刻作锚点，把 UMI 相对运动转换成天机右臂法兰目标。 [UMI 原论文](https://arxiv.org/html/2402.10329v3)
+2. **按实际硬件重定时。** 对目标位姿求连续逆解，检查关节位置、速度、加速度、腕部耦合和碰撞间隙。录下天机带载反馈、Revo2 张指指令和瓶子实际离手时刻，按实测延迟补偿。用实瓶视频测离手速度、翻转角速度和飞行减速，校准水晃动及落桌接触参数。
+3. **用真机试投学习松手窗口。** 一条 UMI 成功示教可提供挥臂与出手的起点，示教结果单独保存。先用少量已验过的挥臂和松手档位做固定参数基线，再将真机成功与失败统一写入上面的 JSONL。用同一瓶型、水量和落区进行独立试投，比较 IQL 与固定基线。
+
 ## 仿真覆盖范围
 
 当前仿真包含带扰动的挥臂反馈、开手延迟、重力抛物线、随时间变化的瓶体转动惯量和近似着地稳定性。它可以闭环验证数据格式、奖励、两次决策和策略相对于固定参数的表现。
 
 瓶内水的惯量变化和着地稳定条件是简化模型。评估天机关节可达速度、Revo2 夹持与脱手、三维接触和真实成功率，需要带标定参数的机械臂与手模型，以及真机数据。后续仿真器只需导出相同的 JSONL 字段，即可复用训练和推理。
+
+### 仿真环境
+
+整臂场景在 Isaac Sim 6.2 的 Python 环境中验证。运行前在该环境检查 `import isaacsim, numpy, scipy`。Revo2 的右手 URDF、网格和许可证随仓库提供。天机资产由本机交付包提供，`--arm-assets` 指向包含 `urdf/Stand-m6.urdf` 和 `meshes/` 的 `Stand-m6` 目录。仿真入口运行时创建桌面、手臂、瓶体和接触场景。 [Revo2 资产来源](assets/revo2/SOURCE.md)
 
 ### Isaac Sim 桌面对照
 
@@ -127,5 +138,44 @@ python -m bottle_flip.isaac_full_demo --arm-assets "/path/to/Stand-m6"
 右臂按 URDF 关节做逆运动学，Revo2 挂在右臂的 `TCP_Link_R` 下。五个指垫基于 Revo2 的触点位置建立 PhysX 碰撞体。瓶子从桌面静止状态开始，靠接触和摩擦获得抓举及脱手速度。绿色是桌面的落点区，侧栏的 `Replay from table` 从头播放。
 
 默认使用本场景标定的动作参数。水的作用用 0.177 kg 瓶体质量、较低重心和阻尼力矩近似，桌面和指垫使用柔顺接触。这里使用运动学关节驱动，未标定实机速度和力矩。既有离线 IQL 对照仍可用上一节的入口启动。 [整臂演示参数](assets/isaac_contact_flip.json)
+
+#### 天机七轴限速演示
+
+```bash
+python -m bottle_flip.isaac_full_demo --arm-assets "/path/to/Stand-m6" \
+  --limited-trajectory assets/isaac_forward_flick.json
+```
+
+加上 `--headless` 可输出单次抛投的 JSON 结果。轨迹以 240 Hz 保存绝对关节角。回放前逐轴核对 URDF 角度和速度上限，找到厂商 M6 配置时取两者约束的交集，并检查 J6/J7 耦合角度限制。交付版右臂 URDF 的七轴限速均为 3.1416 rad/s，M6 配置均为 180°/s。
+
+开掌时手已对准取瓶点，瓶子放在高出桌面 17 cm 的取瓶台上。抓稳后，大臂从竖直向前抬约 35°，小臂屈肘上抬，手腕在出手前向上抖。Revo2 拇指沿瓶身下压，食指提前抬起。开启 `forward_flick` 的轨迹会逐帧检查大臂是否始终向前抬，并检查瓶子是否向前、向上飞出且瓶底向前翻。 [原始翻瓶挑战](https://www.youtube.com/watch?v=GdUVtEeg9I4)
+
+轨迹文件里的 `bottle_mass_kg` 是瓶与水的合计质量，`bottle_com_z_m` 是重心相对瓶身几何中心的竖直偏移。当前配置为 177 g、重心低于几何中心 6.9 cm。实测七轴最高速度约 171.8°/s。瓶子在空中翻转 341.89°，瓶底触桌后站稳 2.45 s。图形界面默认慢放松手阶段，可取消勾选 `Slow-motion release` 恢复正常速度。 [向前抖腕轨迹](assets/isaac_forward_flick.json)
+
+#### Isaac Sim 双指夹盖复刻
+
+```bash
+python -m bottle_flip.isaac_full_demo --arm-assets "/path/to/Stand-m6" \
+  --limited-trajectory assets/isaac_cap_pinch_flip.json
+```
+
+瓶盖直径 31 mm。初始开掌对准瓶盖，拇指和食指对捏后提起，另外三指保持收拢并避开瓶体。大臂从竖直向前抬 39.1°，小臂和手腕上抖。场景使用 17 cm 高的取瓶台和 2.4 m 长的固定台面，瓶和水共 177 g。 [原机器人翻瓶视频](https://x.com/nima10khod/status/2122894797707034873)
+
+轨迹文件里的 `open_at_s` 和 `release_ramp_s` 分别控制双指张开的时刻和张开动作时长。加 `--headless` 可重复传入同一布局下的多个轨迹，对比 `detach.release_delay_ms`、`impact.turn_deg` 和 `upright_s`。延迟从第一帧张指指令到指尖接触力消失的第一帧计算，并以连续八帧无接触确认。物理步长约 4.17 ms。 [双指夹盖轨迹](assets/isaac_cap_pinch_flip.json)
+
+前抛场景按天机 Stand-m6 的本地 `-Y` 定义机身前方。右手装在 `TCP_Link_R`，左臂以静止姿态显示，便于从斜前方辨认两侧。
+
+水位图层随瓶身刚体运动，瓶身的质量、重心和惯量张量取固定值。脱手后用反向力矩逼近水重新分布造成的减速，碰桌后另外施加短时阻尼。`inertia_growth` 控制飞行减速强度。同一条夹盖轨迹把该参数降低或提高 20% 时，转角从标定值约 358° 分别变为 388° 和 338°。实机中的水会改变质量分布，迁移时需要按实际瓶型和水量校准。 [水瓶翻转的流体实验](https://arxiv.org/abs/1712.08271)
+
+#### 天机交付包的 MuJoCo 对照
+
+天机交付包 `app/arms/generated/scene.xml` 由交付包内的 `build_model.py` 从 Stand-m6 URDF 转出。以下命令用交付模型检查同一组关节角，运行时添加桌面、水瓶及 Revo2 指垫接触体。
+
+```bash
+python -m bottle_flip.mujoco_limited --scene "/path/to/app/arms/generated/scene.xml" \
+  --arm-assets "/path/to/Stand-m6" assets/isaac_wrist_flick.json
+```
+
+在 MuJoCo 3.12 中，交付模型可加载运行，早期抖腕轨迹的 TCP 位置与 URDF 正运动学一致。瓶子能靠手指抓离取瓶台，但在出手前滑落，记录为 `no_release`。
 
 方法参考 [IQL 原论文](https://arxiv.org/abs/2110.06169) 和 [水瓶空中翻转实验](https://doi.org/10.1119/1.5052441)。
